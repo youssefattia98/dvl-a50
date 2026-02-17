@@ -9,6 +9,8 @@
 
 #include "dvl_a50/lifecycle_dvl_component.hpp"
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -24,6 +26,63 @@ using nlohmann::json;
 namespace composition
 {
 
+namespace {
+
+void fill_twist_covariance_from_json(
+    const nlohmann::json & json_data,
+    std::array<double, 36> & covariance)
+{
+    covariance.fill(0.0);
+
+    if (!json_data.contains("covariance") || !json_data["covariance"].is_array()) {
+        return;
+    }
+
+    const auto & cov = json_data["covariance"];
+    if (!cov.empty() && cov[0].is_array()) {
+        const size_t rows = cov.size();
+        const size_t cols = cov[0].size();
+        if (rows == 3 && cols >= 3) {
+            for (size_t i = 0; i < 3; ++i) {
+                if (!cov[i].is_array()) {
+                    continue;
+                }
+                for (size_t j = 0; j < 3 && j < cov[i].size(); ++j) {
+                    covariance[i * 6 + j] = cov[i][j].get<double>();
+                }
+            }
+            return;
+        }
+        if (rows == 6 && cols >= 6) {
+            for (size_t i = 0; i < 6; ++i) {
+                if (!cov[i].is_array()) {
+                    continue;
+                }
+                for (size_t j = 0; j < 6 && j < cov[i].size(); ++j) {
+                    covariance[i * 6 + j] = cov[i][j].get<double>();
+                }
+            }
+            return;
+        }
+    }
+
+    if (cov.size() == 9) {
+        for (size_t i = 0; i < 3; ++i) {
+            for (size_t j = 0; j < 3; ++j) {
+                covariance[i * 6 + j] = cov[i * 3 + j].get<double>();
+            }
+        }
+        return;
+    }
+
+    const size_t n = std::min<size_t>(cov.size(), covariance.size());
+    for (size_t i = 0; i < n; ++i) {
+        covariance[i] = cov[i].get<double>();
+    }
+}
+
+}  // namespace
+
 
 
 LifecycleDVL::LifecycleDVL(const rclcpp::NodeOptions & options)
@@ -31,14 +90,17 @@ LifecycleDVL::LifecycleDVL(const rclcpp::NodeOptions & options)
 current_altitude(0.0),
 old_altitude(0.0)
 {
-    this->declare_parameter<std::string>("dvl_ip_address", "192.168.194.95");   
+    this->declare_parameter<std::string>("dvl_ip_address", "192.168.2.95");   
     ip_address = this->get_parameter("dvl_ip_address").as_string();
     RCLCPP_INFO(get_logger(), "IP_ADDRESS: '%s'", ip_address.c_str());
 }
 
 LifecycleDVL::~LifecycleDVL() {
-  tcpSocket->Close();
-  delete tcpSocket;
+    if (tcpSocket != nullptr) {
+        tcpSocket->Close();
+        delete tcpSocket;
+        tcpSocket = nullptr;
+    }
 }
 
 /// Transition callback for state configuring
@@ -49,9 +111,10 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 LifecycleDVL::on_configure(const rclcpp_lifecycle::State &)
 {
     RCLCPP_INFO(get_logger(), "on_configure() is called.");
-    timer_ = this->create_wall_timer(std::chrono::milliseconds(50), std::bind(&LifecycleDVL::on_timer, this));
+    timer_ = this->create_wall_timer(std::chrono::milliseconds(1), std::bind(&LifecycleDVL::on_timer, this));
     dvl_pub_report = this->create_publisher<dvl_msgs::msg::DVL>("dvl/data", 10);
     dvl_pub_pos = this->create_publisher<dvl_msgs::msg::DVLDR>("dvl/position", 10);
+    dvl_pub_twist_cov = this->create_publisher<geometry_msgs::msg::TwistWithCovarianceStamped>("/auv/dvl", 10);
     
 
     //--- TCP/IP SOCKET ---- 
@@ -70,7 +133,7 @@ LifecycleDVL::on_configure(const rclcpp_lifecycle::State &)
     //int fault = 1; 
     
     first_time_error = std::chrono::steady_clock::now();
-    while(fault != 0)
+    while(rclcpp::ok() && fault != 0)
     {
         fault = tcpSocket->Connect(5000, error, error_code);
         if(error_code == 114)
@@ -96,6 +159,12 @@ LifecycleDVL::on_configure(const rclcpp_lifecycle::State &)
             std::this_thread::sleep_for(2s);
         }
     }  
+
+    if (!rclcpp::ok()) {
+        RCLCPP_INFO(get_logger(), "Shutdown requested while connecting to DVL.");
+        tcpSocket->Close();
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::FAILURE;
+    }
     
     //std::chrono::steady_clock::time_point current_time = std::chrono::steady_clock::now();
     //double dt = std::chrono::duration<double>(current_time - first_time).count();
@@ -121,6 +190,7 @@ LifecycleDVL::on_activate(const rclcpp_lifecycle::State &)
 {
     dvl_pub_report->on_activate();
     dvl_pub_pos->on_activate();
+    dvl_pub_twist_cov->on_activate();
     first_time_loss = std::chrono::steady_clock::now();
     RCUTILS_LOG_INFO_NAMED(get_name(), "on_activate() is called.");
     return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -133,6 +203,7 @@ LifecycleDVL::on_deactivate(const rclcpp_lifecycle::State &)
 
     dvl_pub_report->on_deactivate();
     dvl_pub_pos->on_deactivate();
+    dvl_pub_twist_cov->on_deactivate();
     RCUTILS_LOG_INFO_NAMED(get_name(), "on_deactivate() is called.");
     return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
 }
@@ -143,11 +214,14 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 LifecycleDVL::on_cleanup(const rclcpp_lifecycle::State &)
 {
     fault = 1;
-    tcpSocket->Close();
+    if (tcpSocket != nullptr) {
+        tcpSocket->Close();
+    }
  
     timer_.reset();
     dvl_pub_report.reset();
     dvl_pub_pos.reset();
+    dvl_pub_twist_cov.reset();
 
     RCUTILS_LOG_INFO_NAMED(get_name(), "on cleanup is called.");
     return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;  
@@ -157,9 +231,15 @@ LifecycleDVL::on_cleanup(const rclcpp_lifecycle::State &)
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 LifecycleDVL::on_shutdown(const rclcpp_lifecycle::State & state)
 {
+    fault = 1;
+    if (tcpSocket != nullptr) {
+        tcpSocket->Close();
+    }
+
     timer_.reset();
     dvl_pub_report.reset();
     dvl_pub_pos.reset();
+    dvl_pub_twist_cov.reset();
 
     RCUTILS_LOG_INFO_NAMED(
       get_name(),
@@ -174,24 +254,54 @@ LifecycleDVL::on_shutdown(const rclcpp_lifecycle::State & state)
 void LifecycleDVL::on_timer()
 {
 
+  if (!rclcpp::ok()) {
+      return;
+  }
+
+  if (!dvl_pub_report || !dvl_pub_pos || !dvl_pub_twist_cov || !tcpSocket) {
+      return;
+  }
+
   if(!dvl_pub_report->is_activated() || !dvl_pub_pos->is_activated())
   {
       //RCLCPP_INFO(get_logger(), "Lifecycle publisher is currently inactive. Messages are not published.");
   }else {
         std::flush(std::cout);
-        char *tempBuffer = new char[1];
+        char temp_buffer = '\0';
 
         //tcpSocket->Receive(&tempBuffer[0]);
         std::string str; 
     
         //std::chrono::steady_clock::time_point current_time;
-	while(tempBuffer[0] != '\n')
+	while(rclcpp::ok())
 	{
 	    //current_time = std::chrono::steady_clock::now();
 	    //double dt = std::chrono::duration<double>(current_time - first_time_loss).count();
-            tcpSocket->Receive(tempBuffer);
-            str = str + tempBuffer[0];
+            int recv_len = tcpSocket->Receive(&temp_buffer);
+            if (recv_len == 1) {
+                if (temp_buffer == '\n') {
+                    break;
+                }
+                str.push_back(temp_buffer);
+                continue;
+            }
+
+            if (recv_len == 0) {
+                RCLCPP_WARN(get_logger(), "Socket closed by peer.");
+                return;
+            }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                return;
+            }
+
+            RCLCPP_WARN(get_logger(), "Socket receive error: %d", errno);
+            return;
             //std::cout << "dt: " << dt << std::endl;         
+	}
+
+	if (!rclcpp::ok() || str.empty()) {
+	    return;
 	}
 	
 	//first_time_loss = current_time;
@@ -256,6 +366,15 @@ void LifecycleDVL::on_timer()
 		    
 		dvl.beams = {beam0, beam1, beam2, beam3};
 		dvl_pub_report->publish(dvl);
+
+        geometry_msgs::msg::TwistWithCovarianceStamped dvl_twist_cov;
+        dvl_twist_cov.header.stamp = dvl.header.stamp;
+        dvl_twist_cov.header.frame_id = dvl.header.frame_id;
+        dvl_twist_cov.twist.twist.linear.x = dvl.velocity.x;
+        dvl_twist_cov.twist.twist.linear.y = dvl.velocity.y;
+        dvl_twist_cov.twist.twist.linear.z = dvl.velocity.z;
+        fill_twist_covariance_from_json(json_data, dvl_twist_cov.twist.covariance);
+        dvl_pub_twist_cov->publish(dvl_twist_cov);
 		
             }
             else //if (json_data.contains("pitch")) 

@@ -5,7 +5,11 @@ import launch_ros.actions
 
 
 def generate_launch_description():
-    launch.actions.DeclareLaunchArgument('ip_address', default_value='192.168.194.95'),
+    ip_address = launch.actions.DeclareLaunchArgument(
+        'ip_address',
+        default_value='192.168.2.95'
+    )
+
     dvl_a50 = launch_ros.actions.Node(
         package='dvl_a50', 
         executable='dvl_a50_sensor', 
@@ -14,6 +18,7 @@ def generate_launch_description():
 
 
     return launch.LaunchDescription([
+        ip_address,
         dvl_a50,
     ])
 

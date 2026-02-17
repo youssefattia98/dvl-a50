@@ -18,9 +18,10 @@
 #include "dvl_msgs/msg/dvl.hpp"
 #include "dvl_msgs/msg/dvl_beam.hpp"
 #include "dvl_msgs/msg/dvldr.hpp"
+#include "geometry_msgs/msg/twist_with_covariance_stamped.hpp"
 
 //Json Library
-#include "dvl_a50/json/single_include/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 #include <iomanip>
 
 namespace lc = rclcpp_lifecycle;
@@ -114,7 +115,7 @@ private:
   double current_altitude;
   double old_altitude;
   std::string ip_address;
-  TCPSocket *tcpSocket;
+  TCPSocket *tcpSocket{nullptr};
     
   nlohmann::json json_data;
   nlohmann::json json_position;
@@ -134,6 +135,7 @@ private:
     
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<dvl_msgs::msg::DVL>> dvl_pub_report;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<dvl_msgs::msg::DVLDR>> dvl_pub_pos;
+  std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::TwistWithCovarianceStamped>> dvl_pub_twist_cov;
   
   //rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_;
   //rclcpp::TimerBase::SharedPtr timer_;

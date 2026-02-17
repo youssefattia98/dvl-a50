@@ -7,7 +7,81 @@
 
 #include "dvl_a50/dvl-sensor.hpp"
 
+#include <algorithm>
+#include <cerrno>
+
 namespace dvl_sensor {
+
+namespace {
+
+void fill_twist_covariance_from_json(
+    const json &json_data,
+    std::array<double, 36> &covariance)
+{
+    covariance.fill(0.0);
+
+    if (!json_data.contains("covariance") || !json_data["covariance"].is_array())
+    {
+        return;
+    }
+
+    const auto &cov = json_data["covariance"];
+    if (!cov.empty() && cov[0].is_array())
+    {
+        const size_t rows = cov.size();
+        const size_t cols = cov[0].size();
+        if (rows == 3 && cols >= 3)
+        {
+            for (size_t i = 0; i < 3; ++i)
+            {
+                if (!cov[i].is_array())
+                {
+                    continue;
+                }
+                for (size_t j = 0; j < 3 && j < cov[i].size(); ++j)
+                {
+                    covariance[i * 6 + j] = cov[i][j].get<double>();
+                }
+            }
+            return;
+        }
+        if (rows == 6 && cols >= 6)
+        {
+            for (size_t i = 0; i < 6; ++i)
+            {
+                if (!cov[i].is_array())
+                {
+                    continue;
+                }
+                for (size_t j = 0; j < 6 && j < cov[i].size(); ++j)
+                {
+                    covariance[i * 6 + j] = cov[i][j].get<double>();
+                }
+            }
+            return;
+        }
+    }
+
+    if (cov.size() == 9)
+    {
+        for (size_t i = 0; i < 3; ++i)
+        {
+            for (size_t j = 0; j < 3; ++j)
+            {
+                covariance[i * 6 + j] = cov[i * 3 + j].get<double>();
+            }
+        }
+        return;
+    }
+
+    const size_t n = std::min<size_t>(cov.size(), covariance.size());
+    for (size_t i = 0; i < n; ++i)
+    {
+        covariance[i] = cov[i].get<double>();
+    }
+}
+
+}  // namespace
 
 
 DVL_A50::DVL_A50():
@@ -21,16 +95,17 @@ Node("dvl_a50_node")
             qos_profile.depth),
             qos_profile);
 
-    timer_receive = this->create_wall_timer(std::chrono::milliseconds(50),std::bind(&DVL_A50::handle_receive, this));
+    timer_receive = this->create_wall_timer(std::chrono::milliseconds(1),std::bind(&DVL_A50::handle_receive, this));
 
     //Publishers
     dvl_pub_report = this->create_publisher<dvl_msgs::msg::DVL>("dvl/data", qos);
     dvl_pub_pos = this->create_publisher<dvl_msgs::msg::DVLDR>("dvl/position", qos);
+    dvl_pub_twist_cov = this->create_publisher<geometry_msgs::msg::TwistWithCovarianceStamped>("/auv/dvl", qos);
     dvl_pub_config_status = this->create_publisher<dvl_msgs::msg::ConfigStatus>("dvl/config/status", qos);
     dvl_pub_command_response = this->create_publisher<dvl_msgs::msg::CommandResponse>("dvl/command/response", qos);
     dvl_sub_config_command = this->create_subscription<dvl_msgs::msg::ConfigCommand>("dvl/config/command", qos, std::bind(&DVL_A50::command_subscriber, this, _1));
 
-    this->declare_parameter<std::string>("dvl_ip_address", "192.168.194.95");
+    this->declare_parameter<std::string>("dvl_ip_address", "192.168.2.95");
     this->declare_parameter<std::string>("velocity_frame_id", "dvl_A50/velocity_link");
     this->declare_parameter<std::string>("position_frame_id", "dvl_A50/position_link");
     
@@ -83,12 +158,6 @@ Node("dvl_a50_node")
     else
         RCLCPP_INFO(get_logger(), "DVL-A50 connected!");
     
-    /*
-     * Disable transducer operation to limit sensor heating out of water.
-     */
-    this->set_json_parameter("acoustic_enabled", "false");
-    usleep(2000);
-
 }
 
 DVL_A50::~DVL_A50() {
@@ -99,44 +168,85 @@ DVL_A50::~DVL_A50() {
 
 void DVL_A50::handle_receive()
 {
-    char *tempBuffer = new char[1];
-
-    //tcpSocket->Receive(&tempBuffer[0]);
-    std::string str; 
-    
-    if(fault == 0)
+    if (fault != 0 || !tcpSocket)
     {
-        while(tempBuffer[0] != '\n')
-        {
-            if(tcpSocket->Receive(tempBuffer) !=0)
-                str = str + tempBuffer[0];
-        }
-		
-        try
-        {
-            json_data = json::parse(str);
+        return;
+    }
 
-            if (json_data.contains("altitude")) {
-                this->publish_vel_trans_report();
-            }
-            else if (json_data.contains("pitch")) {
-                this->publish_dead_reckoning_report();
-            }
-            else if (json_data.contains("response_to"))
+    std::string str;
+    char temp_buffer = '\0';
+
+    while (rclcpp::ok())
+    {
+        int recv_len = tcpSocket->Receive(&temp_buffer);
+        if (recv_len == 1)
+        {
+            if (temp_buffer == '\n')
             {
-                if(json_data["response_to"] == "set_config"
-                || json_data["response_to"] == "calibrate_gyro"
-                || json_data["response_to"] == "reset_dead_reckoning")
-                    this->publish_command_response();
-                else if(json_data["response_to"] == "get_config")
-                    this->publish_config_status();
+                break;
             }
-        }
-        catch(std::exception& e)
-        {
-            std::cout << "Exception: " << e.what() << std::endl;
+            if (temp_buffer == '\r')
+            {
+                continue;
+            }
+            str.push_back(temp_buffer);
+            continue;
         }
 
+        if (recv_len == 0)
+        {
+            RCLCPP_WARN(get_logger(), "Socket closed by peer.");
+            return;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+        {
+            return;
+        }
+
+        RCLCPP_WARN(get_logger(), "Socket receive error: %d", errno);
+        return;
+    }
+
+    if (!rclcpp::ok() || str.empty())
+    {
+        return;
+    }
+
+    const size_t json_start = str.find_first_of("{[");
+    if (json_start == std::string::npos)
+    {
+        return;
+    }
+
+    if (json_start > 0)
+    {
+        str.erase(0, json_start);
+    }
+
+    try
+    {
+        json_data = json::parse(str);
+
+        if (json_data.contains("altitude")) {
+            this->publish_vel_trans_report();
+        }
+        else if (json_data.contains("pitch")) {
+            this->publish_dead_reckoning_report();
+        }
+        else if (json_data.contains("response_to"))
+        {
+            if(json_data["response_to"] == "set_config"
+            || json_data["response_to"] == "calibrate_gyro"
+            || json_data["response_to"] == "reset_dead_reckoning")
+                this->publish_command_response();
+            else if(json_data["response_to"] == "get_config")
+                this->publish_config_status();
+        }
+    }
+    catch(const std::exception &e)
+    {
+        RCLCPP_WARN(get_logger(), "JSON parse failed: %s", e.what());
     }
 }
 
@@ -220,6 +330,14 @@ void DVL_A50::publish_vel_trans_report()
 		    
     dvl.beams = {beam0, beam1, beam2, beam3};
     dvl_pub_report->publish(dvl);
+
+    geometry_msgs::msg::TwistWithCovarianceStamped dvl_twist_cov;
+    dvl_twist_cov.header = dvl.header;
+    dvl_twist_cov.twist.twist.linear.x = dvl.velocity.x;
+    dvl_twist_cov.twist.twist.linear.y = dvl.velocity.y;
+    dvl_twist_cov.twist.twist.linear.z = -dvl.velocity.z;
+    fill_twist_covariance_from_json(json_data, dvl_twist_cov.twist.covariance);
+    dvl_pub_twist_cov->publish(dvl_twist_cov);
 }
 
 /*
@@ -411,6 +529,7 @@ void DVL_A50::set_json_parameter(const std::string name, const std::string value
 void DVL_A50::send_parameter_to_sensor(const json &message)
 {
     std::string str = message.dump();
+    str.push_back('\n');
     char* c = &*str.begin();
     tcpSocket->Send(c);
 }

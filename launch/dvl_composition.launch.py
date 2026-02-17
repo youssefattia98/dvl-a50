@@ -20,7 +20,7 @@ from launch_ros.descriptions import ComposableNode
 
 
 def generate_launch_description():
-    launch.actions.DeclareLaunchArgument('ip_address', default_value='192.168.194.95'),
+    launch.actions.DeclareLaunchArgument('ip_address', default_value='192.168.2.95'),
     """Generate launch description with multiple components."""
     container = ComposableNodeContainer(
             name='my_container',

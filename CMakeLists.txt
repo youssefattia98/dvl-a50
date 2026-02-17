@@ -25,6 +25,7 @@ find_package(dvl_msgs REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 
 set(node_plugins "")
@@ -39,6 +40,9 @@ ament_python_install_package(scripts)
 # Talker Setup
 add_library(dvl_a50_component SHARED src/lifecycle_dvl_component.cpp)
 target_compile_definitions(dvl_a50_component PRIVATE "COMPOSITION_BUILDING_DLL")
+target_link_libraries(dvl_a50_component
+  nlohmann_json::nlohmann_json
+)
   
 ament_target_dependencies(dvl_a50_component
   "rclcpp_components"
@@ -57,6 +61,9 @@ ament_target_dependencies(${PROJECT_NAME}_sensor rclcpp
     "sensor_msgs" 
     "geometry_msgs" 
     "dvl_msgs")
+target_link_libraries(${PROJECT_NAME}_sensor
+  nlohmann_json::nlohmann_json
+)
 
 
 #Install C++ targets

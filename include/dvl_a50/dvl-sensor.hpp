@@ -23,8 +23,9 @@
 #include "dvl_msgs/msg/config_command.hpp"
 #include "dvl_msgs/msg/command_response.hpp"
 #include "dvl_msgs/msg/config_status.hpp"
+#include "geometry_msgs/msg/twist_with_covariance_stamped.hpp"
 
-#include "dvl_a50/json/single_include/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 #include <iomanip>
 
 using namespace std::chrono_literals;
@@ -72,6 +73,7 @@ private:
     rclcpp::TimerBase::SharedPtr timer_send;
     rclcpp::Publisher<dvl_msgs::msg::DVL>::SharedPtr dvl_pub_report;
     rclcpp::Publisher<dvl_msgs::msg::DVLDR>::SharedPtr dvl_pub_pos;
+    rclcpp::Publisher<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr dvl_pub_twist_cov;
     rclcpp::Publisher<dvl_msgs::msg::CommandResponse>::SharedPtr dvl_pub_command_response;
     rclcpp::Publisher<dvl_msgs::msg::ConfigStatus>::SharedPtr dvl_pub_config_status;
     rclcpp::Subscription<dvl_msgs::msg::ConfigCommand>::SharedPtr dvl_sub_config_command;
