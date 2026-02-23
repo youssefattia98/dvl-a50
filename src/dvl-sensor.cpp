@@ -274,7 +274,11 @@ void DVL_A50::publish_vel_trans_report()
     dvl.velocity.z = double(json_data["vz"]);
     dvl.fom = double(json_data["fom"]);
     double current_altitude = double(json_data["altitude"]);
-    dvl.velocity_valid = json_data["velocity_valid"];
+    const bool vel_ok = json_data.value("velocity_valid", false);
+    dvl.velocity_valid = vel_ok;
+    if (!vel_ok) {
+        return;  // skip dvl/data and /auv/dvl publish
+    }
     
     // Removed logic to add old altitude if not valid. Does not report accurately what is coming from the DVL.
     // Logic should be implemented on a case by case basis.
