@@ -374,9 +374,11 @@ void LifecycleDVL::on_timer()
         geometry_msgs::msg::TwistWithCovarianceStamped dvl_twist_cov;
         dvl_twist_cov.header.stamp = dvl.header.stamp;
         dvl_twist_cov.header.frame_id = dvl.header.frame_id;
+        // Water Linked DVL velocity is FRD: x-forward, y-right, z-down.
+        // Publish /auv/dvl in ROS FLU: x-forward, y-left, z-up.
         dvl_twist_cov.twist.twist.linear.x = dvl.velocity.x;
-        dvl_twist_cov.twist.twist.linear.y = dvl.velocity.y;
-        dvl_twist_cov.twist.twist.linear.z = dvl.velocity.z;
+        dvl_twist_cov.twist.twist.linear.y = -dvl.velocity.y;
+        dvl_twist_cov.twist.twist.linear.z = -dvl.velocity.z;
         fill_twist_covariance_from_json(json_data, dvl_twist_cov.twist.covariance);
         dvl_pub_twist_cov->publish(dvl_twist_cov);
 		
