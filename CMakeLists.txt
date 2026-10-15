@@ -83,6 +83,7 @@ install(TARGETS
 #file(GLOB SCRIPT_FILES scripts/*)
 install(PROGRAMS
   scripts/dvl_a50.py
+  scripts/dvl_time_sync.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

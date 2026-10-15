@@ -105,9 +105,11 @@ Node("dvl_a50_node")
     dvl_pub_command_response = this->create_publisher<dvl_msgs::msg::CommandResponse>("dvl/command/response", qos);
     dvl_sub_config_command = this->create_subscription<dvl_msgs::msg::ConfigCommand>("dvl/config/command", qos, std::bind(&DVL_A50::command_subscriber, this, _1));
 
-    this->declare_parameter<std::string>("dvl_ip_address", "192.168.2.95");
+    this->declare_parameter<std::string>("dvl_ip_address", "192.168.2.125");
     this->declare_parameter<std::string>("velocity_frame_id", "dvl_A50/velocity_link");
     this->declare_parameter<std::string>("position_frame_id", "dvl_A50/position_link");
+    this->declare_parameter<bool>("enable_acoustics_on_startup", true);
+    this->declare_parameter<int>("speed_of_sound", 1491);
     
     velocity_frame_id = this->get_parameter("velocity_frame_id").as_string();
     position_frame_id = this->get_parameter("position_frame_id").as_string();
@@ -128,13 +130,16 @@ Node("dvl_a50_node")
     
     first_time = std::chrono::steady_clock::now();
     first_time_error = first_time;
-    while(fault != 0)
+    while(rclcpp::ok() && fault != 0)
     {
-        fault = tcpSocket->Connect(5000, error, error_code);
+        // Use a short connect timeout so SIGINT can stop the node promptly
+        // even when the DVL is powered off or disconnected.
+        fault = tcpSocket->Connect(500, error, error_code);
         if(error_code == 114)
         {
             RCLCPP_WARN(get_logger(), "Is the sensor on? error_code: %d", error_code);
-            usleep(2000000);
+            for (int i = 0; i < 20 && rclcpp::ok(); ++i)
+                usleep(100000);
             std::chrono::steady_clock::time_point current_time_error = std::chrono::steady_clock::now();
     	    double dt = std::chrono::duration<double>(current_time_error - first_time_error).count();
     	    if(dt >= 78.5) //Max time to set up
@@ -146,17 +151,43 @@ Node("dvl_a50_node")
         else if(error_code == 103)
         {
             RCLCPP_WARN(get_logger(), "No route to host, DVL might be booting?: error_code: %d", error_code);
-            usleep(2000000);
+            for (int i = 0; i < 20 && rclcpp::ok(); ++i)
+                usleep(100000);
         }
     }  
     
+    if (!rclcpp::ok())
+    {
+        tcpSocket->Close();
+        return;
+    }
     if(fault == -10)
     {
         tcpSocket->Close();
         RCLCPP_ERROR(get_logger(), "Turn the sensor on and try again!");
     }
     else
+    {
         RCLCPP_INFO(get_logger(), "DVL-A50 connected!");
+
+        const bool enable_acoustics =
+            this->get_parameter("enable_acoustics_on_startup").as_bool();
+        const int speed_of_sound = this->get_parameter("speed_of_sound").as_int();
+        if (enable_acoustics || speed_of_sound > 0)
+        {
+            json parameters;
+            if (enable_acoustics)
+                parameters["acoustic_enabled"] = true;
+            if (speed_of_sound > 0)
+                parameters["speed_of_sound"] = speed_of_sound;
+            const json command = {{"command", "set_config"}, {"parameters", parameters}};
+            this->send_parameter_to_sensor(command);
+            RCLCPP_INFO(
+                get_logger(),
+                "Configured DVL acoustics=%s, speed_of_sound=%d m/s.",
+                enable_acoustics ? "enabled" : "unchanged", speed_of_sound);
+        }
+    }
     
 }
 
@@ -546,6 +577,9 @@ int main(int argc, char *argv[])
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<dvl_sensor::DVL_A50>();
+    if (!rclcpp::ok()) {
+        return 0;
+    }
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
