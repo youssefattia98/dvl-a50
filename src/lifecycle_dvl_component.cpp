@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <utility>
@@ -27,6 +28,23 @@ namespace composition
 {
 
 namespace {
+
+rclcpp::Time ros_time_from_unix_seconds(double timestamp_seconds)
+{
+    const auto seconds = static_cast<int64_t>(std::floor(timestamp_seconds));
+    auto nanoseconds = static_cast<int64_t>(
+        std::llround((timestamp_seconds - static_cast<double>(seconds)) * 1.0e9));
+
+    if (nanoseconds >= 1000000000LL) {
+        return rclcpp::Time(seconds + 1, 0, RCL_SYSTEM_TIME);
+    }
+    return rclcpp::Time(seconds, static_cast<uint32_t>(nanoseconds), RCL_SYSTEM_TIME);
+}
+
+rclcpp::Time ros_time_from_unix_microseconds(int64_t timestamp_microseconds)
+{
+    return rclcpp::Time(timestamp_microseconds * 1000LL, RCL_SYSTEM_TIME);
+}
 
 void fill_twist_covariance_from_json(
     const nlohmann::json & json_data,
@@ -312,11 +330,16 @@ void LifecycleDVL::on_timer()
 		
             if (json_data.contains("altitude")) {
 		
-		dvl.header.stamp = rclcpp_lifecycle::LifecycleNode::now();
+		const auto time_of_validity = json_data["time_of_validity"].get<int64_t>();
+		dvl.header.stamp = time_of_validity > 0
+                    ? ros_time_from_unix_microseconds(time_of_validity)
+                    : rclcpp_lifecycle::LifecycleNode::now();
 		dvl.header.frame_id = "dvl_A50_report_link";
 		//std::cout << std::setw(4) << json_data << std::endl;
 		
 		dvl.time = double(json_data["time"]);
+		dvl.time_of_validity = time_of_validity;
+		dvl.time_of_transmission = json_data["time_of_transmission"].get<int64_t>();
 		dvl.velocity.x = double(json_data["vx"]);
 		dvl.velocity.y = double(json_data["vy"]);
 		dvl.velocity.z = double(json_data["vz"]);
@@ -324,17 +347,7 @@ void LifecycleDVL::on_timer()
                 current_altitude = double(json_data["altitude"]);
                 const bool vel_ok = json_data.value("velocity_valid", false);
 		dvl.velocity_valid = vel_ok;
-                if (!vel_ok) {
-                    return;  // skip dvl/data and /auv/dvl publish
-                }
-		    
-		if(current_altitude >= 0.0 && dvl.velocity_valid)
-		{
-		    dvl.altitude = current_altitude;
-		    old_altitude = current_altitude;
-		}
-		else
-		    dvl.altitude = old_altitude;
+		dvl.altitude = current_altitude;
 
 
 		dvl.status = json_data["status"];
@@ -371,6 +384,12 @@ void LifecycleDVL::on_timer()
 		dvl.beams = {beam0, beam1, beam2, beam3};
 		dvl_pub_report->publish(dvl);
 
+                // Publish raw ranges regardless of bottom lock, but never feed
+                // an invalid velocity into the fusion topic.
+                if (!vel_ok) {
+                    return;
+                }
+
         geometry_msgs::msg::TwistWithCovarianceStamped dvl_twist_cov;
         dvl_twist_cov.header.stamp = dvl.header.stamp;
         dvl_twist_cov.header.frame_id = dvl.header.frame_id;
@@ -386,9 +405,12 @@ void LifecycleDVL::on_timer()
             else //if (json_data.contains("pitch")) 
             {
 		//std::cout << std::setw(4) << json_data << std::endl;
-		DVLDeadReckoning.header.stamp = rclcpp_lifecycle::LifecycleNode::now();
+		const double measurement_time = double(json_data["ts"]);
+		DVLDeadReckoning.header.stamp = measurement_time > 0.0
+                    ? ros_time_from_unix_seconds(measurement_time)
+                    : rclcpp_lifecycle::LifecycleNode::now();
 		DVLDeadReckoning.header.frame_id = "dvl_A50_position_link";
-		DVLDeadReckoning.time = double(json_data["ts"]);
+		DVLDeadReckoning.time = measurement_time;
 		DVLDeadReckoning.position.x = double(json_data["x"]);
 		DVLDeadReckoning.position.y = double(json_data["y"]);
 		DVLDeadReckoning.position.z = double(json_data["z"]);

@@ -135,6 +135,23 @@ public:
         return recv(this->sock, tempBuffer, buffer_size, 0);
     }
 
+    int Receive(char *buffer, size_t size)
+    {
+        return recv(this->sock, buffer, size, 0);
+    }
+
+    bool SetNonBlocking(bool enabled)
+    {
+        const int flags = fcntl(this->sock, F_GETFL, 0);
+        if (flags < 0)
+        {
+            return false;
+        }
+
+        const int updated_flags = enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+        return fcntl(this->sock, F_SETFL, updated_flags) == 0;
+    }
+
     void Send(char *tempBuffer)
     {
         send(this->sock, tempBuffer, strlen(tempBuffer), 0);

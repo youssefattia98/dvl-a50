@@ -9,10 +9,29 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 
 namespace dvl_sensor {
 
 namespace {
+
+rclcpp::Time ros_time_from_unix_seconds(double timestamp_seconds)
+{
+    const auto seconds = static_cast<int64_t>(std::floor(timestamp_seconds));
+    auto nanoseconds = static_cast<int64_t>(
+        std::llround((timestamp_seconds - static_cast<double>(seconds)) * 1.0e9));
+
+    if (nanoseconds >= 1000000000LL)
+    {
+        return rclcpp::Time(seconds + 1, 0, RCL_SYSTEM_TIME);
+    }
+    return rclcpp::Time(seconds, static_cast<uint32_t>(nanoseconds), RCL_SYSTEM_TIME);
+}
+
+rclcpp::Time ros_time_from_unix_microseconds(int64_t timestamp_microseconds)
+{
+    return rclcpp::Time(timestamp_microseconds * 1000LL, RCL_SYSTEM_TIME);
+}
 
 void fill_twist_covariance_from_json(
     const json &json_data,
@@ -170,6 +189,11 @@ Node("dvl_a50_node")
     {
         RCLCPP_INFO(get_logger(), "DVL-A50 connected!");
 
+        if (!tcpSocket->SetNonBlocking(true))
+        {
+            RCLCPP_WARN(get_logger(), "Could not set the DVL TCP socket to non-blocking mode.");
+        }
+
         const bool enable_acoustics =
             this->get_parameter("enable_acoustics_on_startup").as_bool();
         const int speed_of_sound = this->get_parameter("speed_of_sound").as_int();
@@ -204,23 +228,17 @@ void DVL_A50::handle_receive()
         return;
     }
 
-    std::string str;
-    char temp_buffer = '\0';
+    char temp_buffer[16384];
 
+    // Drain all currently available TCP data in chunks. Reading one byte per
+    // recv() cannot keep up with the JSON report stream and creates a growing
+    // acquisition-to-publication delay.
     while (rclcpp::ok())
     {
-        int recv_len = tcpSocket->Receive(&temp_buffer);
-        if (recv_len == 1)
+        const int recv_len = tcpSocket->Receive(temp_buffer, sizeof(temp_buffer));
+        if (recv_len > 0)
         {
-            if (temp_buffer == '\n')
-            {
-                break;
-            }
-            if (temp_buffer == '\r')
-            {
-                continue;
-            }
-            str.push_back(temp_buffer);
+            receive_buffer_.append(temp_buffer, static_cast<size_t>(recv_len));
             continue;
         }
 
@@ -230,54 +248,74 @@ void DVL_A50::handle_receive()
             return;
         }
 
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
-            return;
+            break;
+        }
+        if (errno == EINTR)
+        {
+            continue;
         }
 
         RCLCPP_WARN(get_logger(), "Socket receive error: %d", errno);
         return;
     }
 
-    if (!rclcpp::ok() || str.empty())
+    if (!rclcpp::ok())
     {
         return;
     }
 
-    const size_t json_start = str.find_first_of("{[");
-    if (json_start == std::string::npos)
+    size_t newline = std::string::npos;
+    while ((newline = receive_buffer_.find('\n')) != std::string::npos)
     {
-        return;
-    }
-
-    if (json_start > 0)
-    {
-        str.erase(0, json_start);
-    }
-
-    try
-    {
-        json_data = json::parse(str);
-
-        if (json_data.contains("altitude")) {
-            this->publish_vel_trans_report();
-        }
-        else if (json_data.contains("pitch")) {
-            this->publish_dead_reckoning_report();
-        }
-        else if (json_data.contains("response_to"))
+        std::string str = receive_buffer_.substr(0, newline);
+        receive_buffer_.erase(0, newline + 1);
+        if (!str.empty() && str.back() == '\r')
         {
-            if(json_data["response_to"] == "set_config"
-            || json_data["response_to"] == "calibrate_gyro"
-            || json_data["response_to"] == "reset_dead_reckoning")
-                this->publish_command_response();
-            else if(json_data["response_to"] == "get_config")
-                this->publish_config_status();
+            str.pop_back();
+        }
+
+        const size_t json_start = str.find_first_of("{[");
+        if (json_start == std::string::npos)
+        {
+            continue;
+        }
+        if (json_start > 0)
+        {
+            str.erase(0, json_start);
+        }
+
+        try
+        {
+            json_data = json::parse(str);
+
+            if (json_data.contains("altitude")) {
+                this->publish_vel_trans_report();
+            }
+            else if (json_data.contains("pitch")) {
+                this->publish_dead_reckoning_report();
+            }
+            else if (json_data.contains("response_to"))
+            {
+                if(json_data["response_to"] == "set_config"
+                || json_data["response_to"] == "calibrate_gyro"
+                || json_data["response_to"] == "reset_dead_reckoning")
+                    this->publish_command_response();
+                else if(json_data["response_to"] == "get_config")
+                    this->publish_config_status();
+            }
+        }
+        catch(const std::exception &e)
+        {
+            RCLCPP_WARN(get_logger(), "JSON parse failed: %s", e.what());
         }
     }
-    catch(const std::exception &e)
+
+    if (receive_buffer_.size() > 1024 * 1024)
     {
-        RCLCPP_WARN(get_logger(), "JSON parse failed: %s", e.what());
+        RCLCPP_WARN(get_logger(), "Discarding oversized incomplete DVL TCP report.");
+        receive_buffer_.clear();
     }
 }
 
@@ -293,11 +331,14 @@ void DVL_A50::publish_vel_trans_report()
     dvl_msgs::msg::DVLBeam beam3;
     dvl_msgs::msg::DVL dvl;
 
-    dvl.header.stamp = Node::now();
+    const auto time_of_validity = json_data["time_of_validity"].get<int64_t>();
+    dvl.header.stamp = time_of_validity > 0
+        ? ros_time_from_unix_microseconds(time_of_validity)
+        : Node::now();
     dvl.header.frame_id = velocity_frame_id;
 		
     dvl.time = double(json_data["time"]);
-    dvl.time_of_validity = json_data["time_of_validity"].get<int64_t>();
+    dvl.time_of_validity = time_of_validity;
     dvl.time_of_transmission = json_data["time_of_transmission"].get<int64_t>();
 
     dvl.velocity.x = double(json_data["vx"]);
@@ -307,9 +348,6 @@ void DVL_A50::publish_vel_trans_report()
     double current_altitude = double(json_data["altitude"]);
     const bool vel_ok = json_data.value("velocity_valid", false);
     dvl.velocity_valid = vel_ok;
-    if (!vel_ok) {
-        return;  // skip dvl/data and /auv/dvl publish
-    }
     
     // Removed logic to add old altitude if not valid. Does not report accurately what is coming from the DVL.
     // Logic should be implemented on a case by case basis.
@@ -366,6 +404,13 @@ void DVL_A50::publish_vel_trans_report()
     dvl.beams = {beam0, beam1, beam2, beam3};
     dvl_pub_report->publish(dvl);
 
+    // Keep the raw report available for timestamped altitude/beam ranges even
+    // when bottom-lock velocity is invalid. Only the fusion velocity topic is
+    // suppressed in that case.
+    if (!vel_ok) {
+        return;
+    }
+
     geometry_msgs::msg::TwistWithCovarianceStamped dvl_twist_cov;
     dvl_twist_cov.header = dvl.header;
     // Water Linked DVL velocity is FRD: x-forward, y-right, z-down.
@@ -384,9 +429,12 @@ void DVL_A50::publish_dead_reckoning_report()
 {
     dvl_msgs::msg::DVLDR DVLDeadReckoning;
     //std::cout << std::setw(4) << json_data << std::endl;
-    DVLDeadReckoning.header.stamp = Node::now();
+    const double measurement_time = double(json_data["ts"]);
+    DVLDeadReckoning.header.stamp = measurement_time > 0.0
+        ? ros_time_from_unix_seconds(measurement_time)
+        : Node::now();
     DVLDeadReckoning.header.frame_id = position_frame_id;
-    DVLDeadReckoning.time = double(json_data["ts"]);
+    DVLDeadReckoning.time = measurement_time;
     DVLDeadReckoning.position.x = double(json_data["x"]);
     DVLDeadReckoning.position.y = double(json_data["y"]);
     DVLDeadReckoning.position.z = double(json_data["z"]);

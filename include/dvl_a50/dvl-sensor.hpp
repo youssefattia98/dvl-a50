@@ -63,6 +63,7 @@ private:
     std::string position_frame_id;
     TCPSocket *tcpSocket;
     json json_data;
+    std::string receive_buffer_;
 
     DVL_Parameters resolveParameter(std::string param);
     
